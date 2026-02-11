@@ -1,0 +1,27 @@
+[Unit]
+Description=Telegram Claude Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=oneup
+Group=oneup
+WorkingDirectory=/home/oneup/telegram-bot
+EnvironmentFile=/home/oneup/telegram-bot/.env
+ExecStart=/home/oneup/telegram-bot/.venv/bin/python3 /home/oneup/telegram-bot/bot.py
+Restart=always
+RestartSec=10
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/home/oneup
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=telegram-bot
+
+[Install]
+WantedBy=multi-user.target
