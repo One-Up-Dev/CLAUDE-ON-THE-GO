@@ -28,6 +28,8 @@ async def run_claude(message: str, config: Config) -> str:
         config.claude_bin,
         "-p", message,
         "--output-format", "json",
+        "--dangerously-skip-permissions",
+        "--model", "opus",
     ]
 
     process = await asyncio.create_subprocess_exec(
