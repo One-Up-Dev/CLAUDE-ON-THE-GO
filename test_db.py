@@ -26,9 +26,11 @@ class TestDedup(unittest.TestCase):
         self.tmp.close()
         self.patcher = patch.object(db, "DB_PATH", self.tmp.name)
         self.patcher.start()
+        db._db_initialized.discard(self.tmp.name)
 
     def tearDown(self):
         self.patcher.stop()
+        db._db_initialized.discard(self.tmp.name)
         os.unlink(self.tmp.name)
 
     def _count(self, content=None):

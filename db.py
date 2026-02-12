@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 DB_PATH = str(Path(__file__).resolve().parent / "database.db")
 DEDUP_WINDOW_SECONDS = 60
 MAX_MESSAGES = 5000
+_db_initialized: set[str] = set()
 
 
 def _now_iso():
@@ -22,7 +23,9 @@ def _now_iso():
 def get_connection():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    _init_db(conn)
+    if DB_PATH not in _db_initialized:
+        _init_db(conn)
+        _db_initialized.add(DB_PATH)
     return conn
 
 
@@ -134,9 +137,9 @@ def _is_duplicate(conn, role, c_hash):
     """Check if a message with the same hash exists in the dedup window."""
     row = conn.execute(
         """SELECT metadata FROM messages
-           WHERE role = ? AND content_hash = ?
+           WHERE role = ? AND (content_hash = ? OR (content_hash IS NULL AND metadata LIKE ?))
            ORDER BY id DESC LIMIT 1""",
-        (role, c_hash),
+        (role, c_hash, f'%"content_hash": "{c_hash}"%'),
     ).fetchone()
     if not row or not row[0]:
         return False
@@ -158,26 +161,27 @@ def save_message(role, content, source="claude-code", session_id=""):
         return
     try:
         conn = get_connection()
-        c_hash = _content_hash(content)
+        try:
+            c_hash = _content_hash(content)
 
-        if _is_duplicate(conn, role, c_hash):
+            if _is_duplicate(conn, role, c_hash):
+                return
+
+            now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+            metadata = json.dumps({
+                "session_id": session_id,
+                "created_at": now,
+                "content_hash": c_hash,
+            })
+            conn.execute(
+                "INSERT INTO messages (role, content, metadata, source, content_hash) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (role, content, metadata, source, c_hash),
+            )
+            conn.commit()
+            _maybe_rotate(conn)
+        finally:
             conn.close()
-            return
-
-        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-        metadata = json.dumps({
-            "session_id": session_id,
-            "created_at": now,
-            "content_hash": c_hash,
-        })
-        conn.execute(
-            "INSERT INTO messages (role, content, metadata, source, content_hash) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (role, content, metadata, source, c_hash),
-        )
-        conn.commit()
-        _maybe_rotate(conn)
-        conn.close()
     except (sqlite3.DatabaseError, sqlite3.OperationalError) as e:
         logger.warning("Failed to save message: %s", e)
 
@@ -206,13 +210,15 @@ def create_task(project_path, description):
     task_id = uuid.uuid4().hex[:12]
     now = _now_iso()
     conn = get_connection()
-    conn.execute(
-        "INSERT INTO tasks (id, project_path, description, status, created_at, updated_at) "
-        "VALUES (?, ?, ?, 'pending', ?, ?)",
-        (task_id, project_path, description, now, now),
-    )
-    conn.commit()
-    conn.close()
+    try:
+        conn.execute(
+            "INSERT INTO tasks (id, project_path, description, status, created_at, updated_at) "
+            "VALUES (?, ?, ?, 'pending', ?, ?)",
+            (task_id, project_path, description, now, now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
     return task_id
 
 
@@ -222,33 +228,39 @@ def update_task(task_id, **kwargs):
     sets = ", ".join(f"{k} = ?" for k in kwargs)
     vals = list(kwargs.values()) + [task_id]
     conn = get_connection()
-    conn.execute(f"UPDATE tasks SET {sets} WHERE id = ?", vals)
-    conn.commit()
-    conn.close()
+    try:
+        conn.execute(f"UPDATE tasks SET {sets} WHERE id = ?", vals)
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def get_task(task_id):
     """Get a task by ID, return dict or None."""
     conn = get_connection()
-    row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
-    conn.close()
-    return dict(row) if row else None
+    try:
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
 
 
 def list_tasks(status=None, limit=20):
     """List recent tasks, optionally filtered by status."""
     conn = get_connection()
-    if status:
-        rows = conn.execute(
-            "SELECT * FROM tasks WHERE status = ? ORDER BY created_at DESC LIMIT ?",
-            (status, limit),
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT * FROM tasks ORDER BY created_at DESC LIMIT ?", (limit,)
-        ).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    try:
+        if status:
+            rows = conn.execute(
+                "SELECT * FROM tasks WHERE status = ? ORDER BY created_at DESC LIMIT ?",
+                (status, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM tasks ORDER BY created_at DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
 
 
 # --- Agent Run CRUD ---
@@ -257,14 +269,16 @@ def list_tasks(status=None, limit=20):
 def create_agent_run(task_id, role, model="sonnet", branch_name="", worktree_path=""):
     """Create a new agent run, return its ID."""
     conn = get_connection()
-    cursor = conn.execute(
-        "INSERT INTO agent_runs (task_id, role, status, model, branch_name, worktree_path, started_at) "
-        "VALUES (?, ?, 'running', ?, ?, ?, ?)",
-        (task_id, role, model, branch_name, worktree_path, _now_iso()),
-    )
-    run_id = cursor.lastrowid
-    conn.commit()
-    conn.close()
+    try:
+        cursor = conn.execute(
+            "INSERT INTO agent_runs (task_id, role, status, model, branch_name, worktree_path, started_at) "
+            "VALUES (?, ?, 'running', ?, ?, ?, ?)",
+            (task_id, role, model, branch_name, worktree_path, _now_iso()),
+        )
+        run_id = cursor.lastrowid
+        conn.commit()
+    finally:
+        conn.close()
     return run_id
 
 
@@ -273,19 +287,23 @@ def update_agent_run(run_id, **kwargs):
     sets = ", ".join(f"{k} = ?" for k in kwargs)
     vals = list(kwargs.values()) + [run_id]
     conn = get_connection()
-    conn.execute(f"UPDATE agent_runs SET {sets} WHERE id = ?", vals)
-    conn.commit()
-    conn.close()
+    try:
+        conn.execute(f"UPDATE agent_runs SET {sets} WHERE id = ?", vals)
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def get_agent_runs(task_id):
     """Get all agent runs for a task."""
     conn = get_connection()
-    rows = conn.execute(
-        "SELECT * FROM agent_runs WHERE task_id = ? ORDER BY id", (task_id,)
-    ).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    try:
+        rows = conn.execute(
+            "SELECT * FROM agent_runs WHERE task_id = ? ORDER BY id", (task_id,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
 
 
 # --- Test Results ---
@@ -296,15 +314,17 @@ def save_test_result(task_id, test_level, passed, total_tests=0, passed_tests=0,
                      agent_run_id=None):
     """Save a test result."""
     conn = get_connection()
-    conn.execute(
-        "INSERT INTO test_results (task_id, agent_run_id, test_level, passed, "
-        "total_tests, passed_tests, failed_tests, output, compiler_errors, "
-        "regressions, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (task_id, agent_run_id, test_level, int(passed), total_tests, passed_tests,
-         failed_tests, output, compiler_errors, regressions, _now_iso()),
-    )
-    conn.commit()
-    conn.close()
+    try:
+        conn.execute(
+            "INSERT INTO test_results (task_id, agent_run_id, test_level, passed, "
+            "total_tests, passed_tests, failed_tests, output, compiler_errors, "
+            "regressions, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (task_id, agent_run_id, test_level, int(passed), total_tests, passed_tests,
+             failed_tests, output, compiler_errors, regressions, _now_iso()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 # --- Regression Log ---
@@ -315,12 +335,14 @@ def log_regression(task_id, agent_role, tests_before, tests_after,
     """Log a regression event."""
     rate = regressions / tests_before if tests_before > 0 else 0.0
     conn = get_connection()
-    conn.execute(
-        "INSERT INTO regression_log (task_id, agent_role, tests_before, tests_after, "
-        "regressions, new_tests, regression_rate, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (task_id, agent_role, tests_before, tests_after, regressions, new_tests,
-         rate, _now_iso()),
-    )
-    conn.commit()
-    conn.close()
+    try:
+        conn.execute(
+            "INSERT INTO regression_log (task_id, agent_role, tests_before, tests_after, "
+            "regressions, new_tests, regression_rate, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (task_id, agent_role, tests_before, tests_after, regressions, new_tests,
+             rate, _now_iso()),
+        )
+        conn.commit()
+    finally:
+        conn.close()

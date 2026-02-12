@@ -26,8 +26,6 @@ from worktree import WorktreeManager
 
 logger = logging.getLogger(__name__)
 
-MAX_RETRIES = 3
-
 # Default agent configs for MVP (Phase 1 — sequential)
 AGENT_DEFAULTS = {
     "planner": AgentConfig(
@@ -111,7 +109,7 @@ class Orchestrator:
         self.task_id = create_task(self.project_path, self.description)
         self.cost_tracker = CostTracker(
             self.task_id,
-            budget_usd=15.0,
+            budget_usd=self.config.build_budget_usd,
             on_threshold=self._handle_budget_threshold,
         )
 
@@ -236,72 +234,78 @@ class Orchestrator:
         # Create worktree
         wt_path = await self.worktrees.create(role)
 
-        error_context = ""
-        for attempt in range(1, MAX_RETRIES + 1):
-            runner = AgentRunner(self.config, agent_config, self.task_id)
+        try:
+            error_context = ""
+            for attempt in range(1, self.config.build_max_retries + 1):
+                runner = AgentRunner(self.config, agent_config, self.task_id)
 
-            prompt = (
-                f"Task: {agent_task.description}\n\n"
-                f"Files to modify: {', '.join(agent_task.files_to_modify) or 'as needed'}\n"
-                f"Files to create: {', '.join(agent_task.files_to_create) or 'as needed'}"
-            )
-
-            result = await runner.run(
-                prompt, cwd=wt_path,
-                handoff_context="\n".join(self._handoff_lines),
-                error_context=error_context,
-            )
-
-            # Record cost
-            self.cost_tracker.record(
-                role, agent_config.model,
-                result.input_tokens, result.output_tokens,
-                result.duration_seconds,
-            )
-
-            # Commit agent work
-            commit_msg = f"feat({role}): {agent_task.description[:60]}"
-            await self.worktrees.commit_agent_work(role, commit_msg)
-
-            # Level 1 test gate
-            level1 = await run_test_level(TestLevel.FAST, wt_path)
-
-            if result.status == AgentStatus.SUCCESS and level1.passed:
-                # Success — update dashboard and move on
-                self.dashboard_entries[role] = AgentDashboardEntry(
-                    role=role, status="done",
-                    cost_usd=self.cost_tracker.total_cost,
-                    duration_seconds=result.duration_seconds,
-                    tokens=result.input_tokens + result.output_tokens,
+                prompt = (
+                    f"Task: {agent_task.description}\n\n"
+                    f"Files to modify: {', '.join(agent_task.files_to_modify) or 'as needed'}\n"
+                    f"Files to create: {', '.join(agent_task.files_to_create) or 'as needed'}"
                 )
-                self._handoff_lines.append(
-                    f"## {role} (done)\n"
-                    f"Files: {', '.join(result.files_modified)}\n"
-                    f"Tests added: {result.tests_added}"
+
+                result = await runner.run(
+                    prompt, cwd=wt_path,
+                    handoff_context="\n".join(self._handoff_lines),
+                    error_context=error_context,
                 )
-                await self._notify_progress()
-                return
 
-            # Failed — prepare retry context
-            error_context = format_compact(level1)
-            if result.errors:
-                error_context += "\n" + "\n".join(result.errors)
+                # Record cost
+                self.cost_tracker.record(
+                    role, agent_config.model,
+                    result.input_tokens, result.output_tokens,
+                    result.duration_seconds,
+                )
 
-            logger.warning(
-                "Agent %s attempt %d failed: %s",
-                role, attempt, error_context[:200],
-            )
+                # Commit agent work
+                commit_msg = f"feat({role}): {agent_task.description[:60]}"
+                await self.worktrees.commit_agent_work(role, commit_msg)
 
-            # Check regression
-            if self.regression_tracker:
-                delta = self.regression_tracker.check(role, level1)
-                if delta.newly_failing > 0:
-                    error_context += f"\nREGRESSION: {delta.newly_failing} tests broke"
+                # Level 1 test gate
+                level1 = await run_test_level(TestLevel.FAST, wt_path)
 
-        # All retries exhausted
-        self.dashboard_entries[role] = AgentDashboardEntry(role=role, status="error")
-        await self._notify_progress()
-        raise RuntimeError(f"Agent {role} failed after {MAX_RETRIES} retries")
+                if result.status == AgentStatus.SUCCESS and level1.passed:
+                    # Success — update dashboard and move on
+                    self.dashboard_entries[role] = AgentDashboardEntry(
+                        role=role, status="done",
+                        cost_usd=self.cost_tracker.total_cost,
+                        duration_seconds=result.duration_seconds,
+                        tokens=result.input_tokens + result.output_tokens,
+                    )
+                    self._handoff_lines.append(
+                        f"## {role} (done)\n"
+                        f"Files: {', '.join(result.files_modified)}\n"
+                        f"Tests added: {result.tests_added}"
+                    )
+                    await self._notify_progress()
+                    return
+
+                # Failed — prepare retry context
+                error_context = format_compact(level1)
+                if result.errors:
+                    error_context += "\n" + "\n".join(result.errors)
+
+                logger.warning(
+                    "Agent %s attempt %d failed: %s",
+                    role, attempt, error_context[:200],
+                )
+
+                # Check regression
+                if self.regression_tracker:
+                    delta = self.regression_tracker.check(role, level1)
+                    if delta.newly_failing > 0:
+                        error_context += f"\nREGRESSION: {delta.newly_failing} tests broke"
+
+            # All retries exhausted
+            self.dashboard_entries[role] = AgentDashboardEntry(role=role, status="error")
+            await self._notify_progress()
+            raise RuntimeError(f"Agent {role} failed after {self.config.build_max_retries} retries")
+
+        except Exception:
+            # Cleanup this agent's worktree immediately on failure
+            await self.worktrees.remove(role)
+            raise
 
     async def _set_status(self, status: TaskStatus):
         self.status = status
@@ -318,9 +322,13 @@ class Orchestrator:
 
     def _handle_budget_threshold(self, task_id, percent, cost, budget):
         if self._on_budget_alert:
-            asyncio.get_event_loop().create_task(
-                self._on_budget_alert(task_id, percent, cost, budget)
-            )
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(
+                    self._on_budget_alert(task_id, percent, cost, budget)
+                )
+            except RuntimeError:
+                pass
 
     def _build_dashboard(self) -> TaskDashboard:
         baseline_tests = self.regression_tracker.baseline.total_tests if self.regression_tracker else 0
@@ -331,7 +339,7 @@ class Orchestrator:
             status=self.status,
             agents=list(self.dashboard_entries.values()),
             total_cost_usd=self.cost_tracker.total_cost if self.cost_tracker else 0,
-            budget_usd=self.cost_tracker.budget_usd if self.cost_tracker else 15.0,
+            budget_usd=self.cost_tracker.budget_usd if self.cost_tracker else self.config.build_budget_usd,
             baseline_tests=baseline_tests,
             regressions=regressions,
         )
