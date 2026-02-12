@@ -26,46 +26,49 @@ from worktree import WorktreeManager
 
 logger = logging.getLogger(__name__)
 
+# Resolve agent prompts relative to this file (agents/ directory in repo)
+_AGENTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agents")
+
 # Default agent configs for MVP (Phase 1 — sequential)
 AGENT_DEFAULTS = {
     "planner": AgentConfig(
         role="planner",
-        prompt_file=os.path.expanduser("~/.claude/agents/cotg-planner.md"),
+        prompt_file=os.path.join(_AGENTS_DIR, "cotg-planner.md"),
         model="opus",
         timeout=120,
         budget_usd=3.0,
     ),
     "rust-backend": AgentConfig(
         role="rust-backend",
-        prompt_file=os.path.expanduser("~/.claude/agents/cotg-rust-backend.md"),
+        prompt_file=os.path.join(_AGENTS_DIR, "cotg-rust-backend.md"),
         model="sonnet",
         timeout=600,
         budget_usd=1.50,
     ),
     "rust-frontend": AgentConfig(
         role="rust-frontend",
-        prompt_file=os.path.expanduser("~/.claude/agents/cotg-rust-frontend.md"),
+        prompt_file=os.path.join(_AGENTS_DIR, "cotg-rust-frontend.md"),
         model="sonnet",
         timeout=600,
         budget_usd=1.50,
     ),
     "rust-database": AgentConfig(
         role="rust-database",
-        prompt_file=os.path.expanduser("~/.claude/agents/cotg-rust-database.md"),
+        prompt_file=os.path.join(_AGENTS_DIR, "cotg-rust-database.md"),
         model="sonnet",
         timeout=300,
         budget_usd=1.50,
     ),
     "rust-architect": AgentConfig(
         role="rust-architect",
-        prompt_file=os.path.expanduser("~/.claude/agents/cotg-rust-architect.md"),
+        prompt_file=os.path.join(_AGENTS_DIR, "cotg-rust-architect.md"),
         model="sonnet",
         timeout=300,
         budget_usd=2.0,
     ),
     "tester-cargo": AgentConfig(
         role="tester-cargo",
-        prompt_file=os.path.expanduser("~/.claude/agents/cotg-tester-cargo.md"),
+        prompt_file=os.path.join(_AGENTS_DIR, "cotg-tester-cargo.md"),
         model="sonnet",
         timeout=600,
         budget_usd=1.0,
