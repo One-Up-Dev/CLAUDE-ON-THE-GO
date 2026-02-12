@@ -14,6 +14,7 @@ from telegram.ext import (
 )
 
 from claude_runner import run_claude
+from commands import handle_build, handle_status
 from config import Config
 from db import save_message
 from formatting import (
@@ -143,6 +144,8 @@ def main() -> None:
 
     auth = filters.Chat(chat_id=config.allowed_chat_id)
     app.add_handler(CommandHandler("start", handle_start, filters=auth))
+    app.add_handler(CommandHandler("build", handle_build, filters=auth))
+    app.add_handler(CommandHandler("status", handle_status, filters=auth))
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND & auth, handle_message)
     )
