@@ -10,13 +10,16 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 DB_PATH = str(Path(__file__).resolve().parent / "database.db")
-DEDUP_WINDOW_SECONDS = 60
 MAX_MESSAGES = 5000
+_db_initialized: set[str] = set()
 
 
 def get_connection():
     conn = sqlite3.connect(DB_PATH)
-    _init_db(conn)
+    conn.row_factory = sqlite3.Row
+    if DB_PATH not in _db_initialized:
+        _init_db(conn)
+        _db_initialized.add(DB_PATH)
     return conn
 
 
@@ -50,25 +53,14 @@ def _content_hash(text):
 
 
 def _is_duplicate(conn, role, c_hash):
-    """Check if a message with the same hash exists in the dedup window."""
+    """Check if the last message with the same role has the same content hash."""
     row = conn.execute(
-        """SELECT metadata FROM messages
-           WHERE role = ? AND content_hash = ?
-           ORDER BY id DESC LIMIT 1""",
-        (role, c_hash),
+        "SELECT content_hash FROM messages WHERE role = ? ORDER BY id DESC LIMIT 1",
+        (role,),
     ).fetchone()
-    if not row or not row[0]:
+    if not row:
         return False
-    try:
-        meta = json.loads(row[0])
-        last_time = meta.get("created_at", "")
-        if not last_time:
-            return False
-        last_dt = datetime.fromisoformat(last_time.replace("Z", "+00:00"))
-        now_dt = datetime.now(timezone.utc)
-        return abs((now_dt - last_dt).total_seconds()) < DEDUP_WINDOW_SECONDS
-    except (json.JSONDecodeError, ValueError):
-        return False
+    return row["content_hash"] == c_hash
 
 
 def save_message(role, content, source="claude-code", session_id=""):
@@ -77,26 +69,27 @@ def save_message(role, content, source="claude-code", session_id=""):
         return
     try:
         conn = get_connection()
-        c_hash = _content_hash(content)
+        try:
+            c_hash = _content_hash(content)
 
-        if _is_duplicate(conn, role, c_hash):
+            if _is_duplicate(conn, role, c_hash):
+                return
+
+            now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+            metadata = json.dumps({
+                "session_id": session_id,
+                "created_at": now,
+                "content_hash": c_hash,
+            })
+            conn.execute(
+                "INSERT INTO messages (role, content, metadata, source, content_hash) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (role, content, metadata, source, c_hash),
+            )
+            conn.commit()
+            _maybe_rotate(conn)
+        finally:
             conn.close()
-            return
-
-        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-        metadata = json.dumps({
-            "session_id": session_id,
-            "created_at": now,
-            "content_hash": c_hash,
-        })
-        conn.execute(
-            "INSERT INTO messages (role, content, metadata, source, content_hash) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (role, content, metadata, source, c_hash),
-        )
-        conn.commit()
-        _maybe_rotate(conn)
-        conn.close()
     except (sqlite3.DatabaseError, sqlite3.OperationalError) as e:
         logger.warning("Failed to save message: %s", e)
 

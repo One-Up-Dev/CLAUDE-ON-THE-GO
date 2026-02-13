@@ -20,14 +20,26 @@ def get_recent_messages(limit=MESSAGE_LIMIT):
         return []
     try:
         conn = sqlite3.connect(DB_PATH)
+        # Fetch more to compensate for dedup filtering
         cursor = conn.execute(
-            """SELECT role, content, metadata, source
+            """SELECT role, content, metadata, source, content_hash
                FROM messages ORDER BY id DESC LIMIT ?""",
-            (limit,),
+            (limit * 2,),
         )
         rows = cursor.fetchall()
         conn.close()
-        return list(reversed(rows))
+
+        # Deduplicate consecutive messages with the same content hash
+        deduped = []
+        prev_hash = None
+        for row in reversed(rows):
+            c_hash = row[4]  # content_hash column
+            if c_hash and c_hash == prev_hash:
+                continue  # Skip duplicate
+            prev_hash = c_hash
+            deduped.append(row[:4])  # (role, content, metadata, source)
+
+        return deduped[-limit:]  # Trim to limit after dedup
     except (sqlite3.DatabaseError, sqlite3.OperationalError):
         return []
 

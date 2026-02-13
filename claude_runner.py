@@ -10,6 +10,16 @@ from config import Config
 logger = logging.getLogger(__name__)
 
 
+def _claude_env() -> dict[str, str]:
+    """Return env with writable TMPDIR."""
+    env = os.environ.copy()
+    env["NO_COLOR"] = "1"
+    tmpdir = os.path.expanduser("~/tmp")
+    os.makedirs(tmpdir, exist_ok=True)
+    env["TMPDIR"] = tmpdir
+    return env
+
+
 async def run_claude(message: str, config: Config) -> str:
     """Execute claude -p with message, return response text.
 
@@ -38,7 +48,7 @@ async def run_claude(message: str, config: Config) -> str:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=config.claude_cwd,
-        env={**os.environ, "NO_COLOR": "1"},
+        env=_claude_env(),
     )
 
     try:
