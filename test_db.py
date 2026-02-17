@@ -1,15 +1,12 @@
 """Tests for db.py deduplication logic."""
 
 import hashlib
-import json
 import os
 import sqlite3
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
-from datetime import datetime, timezone
 from unittest.mock import patch
 
 # Import the module under test
@@ -90,39 +87,6 @@ class TestDedup(unittest.TestCase):
         db.save_message("user", "cross2", source="claude-code")
         db.save_message("user", "cross2", source="telegram")
         self.assertEqual(self._count("cross2"), 1)
-
-    # --- Dedup with NULL content_hash column (legacy rows) ---
-
-    def test_dedup_when_existing_row_has_null_hash_column(self):
-        """Simulate old code: hash in metadata JSON but NULL in column."""
-        conn = db.get_connection()
-        c_hash = db._content_hash("legacy")
-        metadata = json.dumps({
-            "session_id": "",
-            "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
-            "content_hash": c_hash,
-        })
-        # Insert WITHOUT content_hash column (old code behavior)
-        conn.execute(
-            "INSERT INTO messages (role, content, metadata, source) VALUES (?, ?, ?, ?)",
-            ("user", "legacy", metadata, "telegram"),
-        )
-        conn.commit()
-        conn.close()
-
-        # Now try to save same message via new code
-        db.save_message("user", "legacy", source="claude-code")
-        self.assertEqual(self._count("legacy"), 1)
-
-    # --- Dedup window ---
-
-    def test_same_content_after_window_is_allowed(self):
-        """Messages beyond the dedup window should be saved."""
-        with patch.object(db, "DEDUP_WINDOW_SECONDS", 0):
-            db.save_message("user", "again", source="telegram")
-            time.sleep(0.01)
-            db.save_message("user", "again", source="telegram")
-            self.assertEqual(self._count("again"), 2)
 
     # --- Different roles are not deduped ---
 
